@@ -1,0 +1,4 @@
+(executable
+ (name bench_gc)
+ (modules bench_gc)
+ (libraries allocation_free_gc threads unix))

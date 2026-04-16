@@ -1,0 +1,4 @@
+(library
+ (name allocation_free_gc)
+ (modules gc_sig alloc_free_gc dynamic_gc regional_alloc_free_gc runtime_alloc_free runtime_dynamic)
+ (libraries threads))
