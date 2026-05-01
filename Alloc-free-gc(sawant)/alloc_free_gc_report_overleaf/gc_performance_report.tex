@@ -1,266 +1,280 @@
-\documentclass[11pt]{article}
+\documentclass[11pt,a4paper]{article}
 
+% CS6868 Research Mini-Project Report
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
 \usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{longtable}
 \usepackage{array}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
 \usepackage{hyperref}
-\usepackage{float}
+\usepackage[capitalise,noabbrev]{cleveref}
 
 \graphicspath{{report_figures/}}
 
-\title{\textbf{Alloc-free-gc: Design and Performance Evaluation of Allocation-conscious Semi-space Garbage Collectors}}
-\author{Independent Project Report}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black,
+}
+
+\definecolor{codegray}{gray}{0.95}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codegray},
+  frame=single,
+  framesep=4pt,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+}
+
+\title{%
+  \textbf{CS6868 Research Mini-Project} \\[0.3em]
+  \Large Alloc-free-gc: Allocation-conscious Semi-space Garbage Collection in OxCaml%
+}
+\author{%
+  Aditya Sawant \\ \texttt{CS23B003}
+}
 \date{\today}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-\texttt{Alloc-free-gc} is an independent experimental garbage-collection runtime
-for a small OCaml-style language implementation. The project evaluates whether
-semi-space copying collectors written in OCaml/OxCaml can remain competitive
-when the allocation fast path and heap ownership are handled by a compact C
-runtime layer. The implementation compares five collector variants: a normal
-OCaml collector, a zero-allocation OxCaml collector, an off-heap metadata
-zero-allocation collector, a threaded off-heap collector, and a stack-threaded
-collector service. The benchmark data show that the variants are close in
-absolute runtime, with \texttt{zero\_offheap} giving the best aggregate mean in
-the current benchmark matrix. However, the checked-in data contain one run per
-configuration, so the results should be interpreted as directional evidence
-rather than statistically conclusive proof. The main finding is that
-zero-allocation and off-heap metadata techniques can make an OxCaml collector
-competitive with a normal OCaml collector, but the benefit is workload-sensitive
-and modest in the present implementation.
+\texttt{Alloc-free-gc} is an independent experimental garbage-collection
+runtime for a small OCaml-style language implementation. The project studies
+whether semi-space copying collection can be implemented in OCaml/OxCaml while
+remaining competitive with a normal OCaml collector when heap ownership and the
+allocation fast path are kept in C. The implementation compares five collector
+variants: a normal OCaml collector, a zero-allocation OxCaml collector, an
+off-heap metadata zero-allocation collector, a threaded off-heap collector, and
+a stack-threaded collector service. On the checked-in benchmark matrix,
+\texttt{zero\_offheap} has the best aggregate mean time, 4.914 seconds versus
+5.127 seconds for \texttt{normal}. The improvement is modest, and the data have
+one run per configuration, so the result is best read as directional rather
+than statistically conclusive. The main conclusion is that allocation-conscious
+OxCaml collection is viable, but zero-allocation annotations alone are not a
+universal win; metadata placement and runtime coordination also matter.
 \end{abstract}
 
-\section{Introduction}
+% =============================================================================
+\section{Goals}
+\label{sec:goals}
+% =============================================================================
 
-Garbage collectors are normally implemented in low-level runtime code, because
-they must manipulate raw heap words, update roots, copy objects, and avoid
-accidentally allocating while memory is already under pressure. The goal of
-\texttt{Alloc-free-gc} is to test a different engineering approach: keep the
-allocation fast path and heap memory management in C, but implement the
-collection logic in OCaml/OxCaml with careful attention to allocation behavior.
+The goal of this project was to build and evaluate a small garbage-collection
+runtime in which the collector logic is written in OCaml/OxCaml rather than
+entirely in C. The project focuses on a stop-the-world semi-space copying
+collector, a design that is simple enough to implement completely while still
+exercising important runtime-system concerns: root discovery, object copying,
+pointer forwarding, heap-space swapping, and multi-threaded mutator
+coordination.
 
-The project is self-contained. It defines its own runtime interface, benchmark
-programs, build rules, collector implementations, result CSV files, and plotting
-scripts. The runtime uses an OCaml-style value representation, but the report
-treats \texttt{Alloc-free-gc} as an independent system rather than as an
-extension of another repository.
+The project connects to CS6868 topics in two ways. First, the runtime uses
+threads, shared state, condition variables, and stop-the-world synchronization,
+which are direct applications of concurrent programming and synchronization
+ideas. Second, several variants change how the runtime crosses the boundary
+between C and OCaml/OxCaml, which makes the project a practical study of
+contention, coordination overhead, and implementation tradeoffs in systems with
+multiple execution contexts.
 
-The work is organized around three questions:
+The research question is:
 
-\begin{enumerate}
-  \item Can a normal OCaml implementation of a copying collector serve as a
-  reasonable baseline behind a C runtime ABI?
-  \item Do OxCaml zero-allocation annotations improve the collection hot path in
-  measurable end-to-end benchmarks?
-  \item Does moving collector metadata off the OCaml heap, or running
-  collection through a persistent worker thread, improve performance or
-  stability?
-\end{enumerate}
+\begin{quote}
+Can a semi-space garbage collector implemented in allocation-conscious
+OCaml/OxCaml be competitive with a normal OCaml implementation when all variants
+share the same C allocation fast path?
+\end{quote}
 
-\section{System Overview}
+The secondary question is which optimization matters most: local zero-allocation
+coding style, off-heap metadata, or persistent worker-thread execution.
 
-\texttt{Alloc-free-gc} is split into three layers:
+% =============================================================================
+\section{Background}
+\label{sec:background}
+% =============================================================================
 
-\begin{itemize}
+\subsection{Semi-space Copying Collection}
+
+The collector uses the classic semi-space copying strategy. The heap is divided
+into two equal regions: from-space and to-space. Mutators allocate linearly in
+from-space using a bump pointer. When allocation fails, mutators stop and the
+collector copies all reachable objects into to-space. After collection,
+from-space and to-space are swapped, and allocation resumes after the copied
+live data.
+
+The traversal is Cheney-style breadth-first copying~\cite{cheney1970}. The
+collector maintains a \texttt{free\_ptr}, where the next copied object will be
+placed, and a \texttt{scan\_ptr}, which walks through objects already copied to
+to-space. Roots are copied first. Then the collector scans copied objects and
+copies any reachable pointer fields that still point into the old from-space.
+
+\begin{lstlisting}[language=C,caption={High-level semi-space collection sketch.},label={lst:cheney}]
+free_ptr = to_space_start;
+scan_ptr = to_space_start;
+
+for root in roots:
+  root = copy(root, &free_ptr);
+
+while scan_ptr < free_ptr:
+  obj = scan_ptr;
+  for field in obj.pointer_fields:
+    field = copy(field, &free_ptr);
+  scan_ptr += object_size(obj);
+
+swap(from_space, to_space);
+current_heap_ptr = free_ptr - new_from_space;
+\end{lstlisting}
+
+\subsection{Runtime Representation}
+
+The runtime uses an OCaml-style tagged-word representation. Integers have low
+bit \(1\), while heap pointers have low bit \(0\). Heap pointers exposed to
+program code point to the object body. The object header is stored one word
+before the body and records the object size and tag.
+
+During copying, the old object is converted into a forwarding object: the header
+is overwritten with a forwarding marker, and the first payload slot stores the
+new body pointer. Later visits to the same object can then return the forwarded
+address without copying the object again.
+
+\subsection{Root Tracking and Stop-the-world Collection}
+
+Root tracking is explicit. Each mutator has a thread-local stack of root
+addresses, a stack index, a return-value root slot, and an active/inactive flag.
+The collector scans root addresses and updates them in place after moving
+objects.
+
+Collection is stop-the-world. When the allocation path cannot satisfy a request,
+the requesting mutator marks a GC request and waits until all active mutators
+reach a polling or allocation point. The selected collector variant then runs
+with no concurrent mutation.
+
+% =============================================================================
+\section{Tasks Undertaken}
+\label{sec:tasks}
+% =============================================================================
+
+\subsection{Implementation}
+
+The project is organized into three layers.
+
+\begin{itemize}[leftmargin=*]
   \item \textbf{Runtime layer}: \texttt{runtime.c} and \texttt{runtime.h}
-  provide allocation entry points, tagged-value helpers, explicit root
-  registration, mutator thread startup, and stop-the-world coordination.
+  define tagged-value helpers, allocation entry points, mutator thread startup,
+  explicit root registration, and stop-the-world coordination.
   \item \textbf{FFI and heap layer}: \texttt{gc\_ffi.c} embeds the OCaml/OxCaml
-  runtime, owns the semi-space heap, exposes the \texttt{mmtk\_*} ABI used by
-  the runtime layer, and provides no-allocation C stubs for raw word access.
-  \item \textbf{Collector layer}: one OCaml/OxCaml collector module is selected
-  at build time using the \texttt{GC=} Makefile variable.
+  runtime, owns the semi-space heap, exposes the \texttt{mmtk\_*} ABI consumed
+  by the runtime layer, and provides no-allocation C stubs for raw memory
+  access.
+  \item \textbf{Collector layer}: one OCaml/OxCaml module is selected at build
+  time through the Makefile variable \texttt{GC=}.
 \end{itemize}
 
-This separation is important for the benchmark interpretation. All variants use
-the same C allocation fast path. Therefore, the benchmark primarily compares
-collection and root-scanning implementation style, not allocation ABI overhead.
+The implemented collector variants are:
 
-\section{Runtime Model}
+\paragraph{Normal OCaml collector.}
+\texttt{gc\_normal.ml} is the baseline. It implements the same semi-space
+algorithm using ordinary OCaml references and arrays for metadata. This gives a
+direct comparison point for the allocation-conscious variants.
 
-\subsection{Value Representation}
+\paragraph{Zero-allocation OxCaml collector.}
+\texttt{gc.ml}, selected by \texttt{GC=zero}, rewrites the hot collection path
+with OxCaml zero-allocation annotations. The copy function returns both the
+updated pointer and next free pointer without allocating an OCaml pair.
 
-The runtime uses a tagged machine-word representation. Integers have low bit
-\(1\), while heap pointers have low bit \(0\). The helper macros in
-\texttt{runtime.h} encode and decode integers:
+\paragraph{Off-heap metadata collector.}
+\texttt{gc\_zero\_offheap.ml}, selected by \texttt{GC=zero\_offheap}, moves
+persistent metadata into malloc-backed memory. Static root slots, mutator root
+stack pointers, stack-index pointers, return-root pointers, active-thread flags,
+and counters are accessed through no-allocation C stubs.
 
-\[
-  \texttt{long2val}(x) = (x \ll 1) + 1, \qquad
-  \texttt{val2long}(x) = x \gg 1.
-\]
+\paragraph{Threaded off-heap collector.}
+\texttt{GC=zero\_offheap\_threaded} uses the same off-heap collector but runs
+collection through a persistent sleeping GC worker thread. Allocation failure
+wakes the worker after mutators have stopped.
 
-Heap object pointers exposed to mutator code point to the object body. The
-object header is stored one word before the body pointer. The header stores the
-object size and tag. During copying, the collector overwrites the old header
-with a forwarding marker and stores the forwarded body pointer in the first
-payload word.
+\paragraph{Stack-threaded collector service.}
+\texttt{gc\_stack\_threaded.ml}, selected by
+\texttt{GC=zero\_stack\_threaded}, runs collection inside a long-lived OxCaml
+service loop. C owns mutator metadata; the OxCaml service thread performs only
+collection when it receives a command.
 
-\subsection{Heap Layout}
+\subsection{Testing and Verification}
 
-The heap is a two-space copying heap with a from-space and a to-space. Allocation
-uses a bump pointer in from-space. When allocation fails, the runtime stops
-mutators, invokes the selected collector, copies reachable objects to to-space,
-swaps the spaces, and resets the bump pointer to the number of live bytes.
+Correctness was tested at three levels.
 
-The configured heap size is defined in \texttt{runtime.h}. On a 64-bit target,
-the current configuration gives approximately one GiB per semi-space:
-
-\[
-  \texttt{HEAP\_SIZE} = 4096 \times 1024 \times 32 \quad \text{words}.
-\]
-
-\subsection{Root Tracking}
-
-Root tracking is explicit. Each mutator has:
-
-\begin{itemize}
-  \item a thread-local root stack,
-  \item a stack-index slot,
-  \item a return-value root slot, and
-  \item an active/inactive state.
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Smoke test}: \texttt{smoke\_test.c} allocates small linked
+  objects, writes fields, and reads them back through the runtime API.
+  \item \textbf{Single-threaded tree benchmark}: \texttt{benchmarks/binary\_tree.c}
+  builds stretch, temporary, and long-lived trees and checks node-count
+  traversals after allocation and collection.
+  \item \textbf{Multi-threaded tree benchmark}:
+  \texttt{benchmarks/binary\_tree\_multithreaded.c} runs the same allocation
+  pattern across multiple worker threads and checks that all workers complete
+  with the expected tree checksums.
 \end{itemize}
 
-Local variables that may contain heap pointers are registered by address. During
-collection, the collector reads each root value, copies the referenced object if
-needed, and writes the updated pointer back through the registered address. This
-keeps root discovery precise and avoids conservative stack scanning.
+The benchmark is not a formal proof of collector correctness, but it exercises
+the important invariants for this project: roots must be updated after copying,
+return values must survive allocation during nested calls, long-lived objects
+must remain reachable, and stopped mutators must resume with valid pointers.
 
-\subsection{Stop-the-world Coordination}
+% =============================================================================
+\section{Evaluation}
+\label{sec:evaluation}
+% =============================================================================
 
-Collection is stop-the-world. When allocation cannot be satisfied, the
-requesting mutator marks GC as requested and waits until active mutators reach a
-polling or allocation point. After all mutators are stopped, collection runs and
-the runtime broadcasts completion. This design avoids concurrent mutation during
-copying, which keeps the collector implementation small enough to compare
-implementation strategies directly.
-
-\section{Collector Variants}
-
-\subsection{Normal OCaml Collector}
-
-\texttt{gc\_normal.ml} is the baseline implementation. It implements the
-semi-space collector in ordinary OCaml, using OCaml arrays and references for
-metadata and mutable state. It is intentionally straightforward:
-
-\begin{enumerate}
-  \item initialize \texttt{free\_ptr} and \texttt{scan\_ptr} to the beginning of
-  to-space;
-  \item copy static roots, mutator return roots, and local roots;
-  \item perform Cheney-style breadth-first traversal over copied objects;
-  \item copy pointer fields encountered during traversal; and
-  \item finish collection by swapping spaces in the C heap layer.
-\end{enumerate}
-
-This variant establishes the cost of writing the collector in ordinary OCaml
-without special zero-allocation restrictions.
-
-\subsection{Zero-allocation OxCaml Collector}
-
-\texttt{gc.ml}, built as \texttt{GC=zero}, rewrites the hot path with OxCaml
-zero-allocation annotations. The collector avoids ordinary heap allocation in
-bounded collection logic. For example, the copy function returns both the
-possibly updated pointer and the next free pointer using an unboxed multi-value
-style rather than allocating a pair or mutating an OCaml reference.
-
-This design tests whether local hot-path allocation control is enough to improve
-runtime while leaving persistent metadata in OCaml-managed arrays.
-
-\subsection{Zero-allocation Off-heap Metadata Collector}
-
-\texttt{gc\_zero\_offheap.ml}, built as \texttt{GC=zero\_offheap}, moves
-persistent metadata out of the OCaml heap. Static root slots, root-stack
-pointers, stack-index pointers, return-root pointers, active-thread flags, and
-counters are stored in malloc-backed memory. The collector accesses this region
-through no-allocation C stubs.
-
-The motivation is to reduce interference between the collector implementation
-and the embedded OCaml runtime. If collector metadata lives outside the OCaml
-heap, then collection bookkeeping is less likely to create pressure on the host
-runtime's own memory manager.
-
-\subsection{Threaded Off-heap Collector}
-
-\texttt{GC=zero\_offheap\_threaded} uses the same off-heap metadata collector
-but compiles \texttt{gc\_ffi.c} with a persistent sleeping GC worker thread.
-When allocation fails and mutators have stopped, the C runtime wakes the worker
-to perform collection.
-
-This variant tests whether keeping a long-lived OCaml-capable worker thread
-reduces per-collection runtime coordination overhead. The tradeoff is an extra
-synchronized command path between the mutator runtime and the GC worker.
-
-\subsection{Stack-threaded Collector Service}
-
-\texttt{GC=zero\_stack\_threaded} routes collection through a long-lived OxCaml
-service loop implemented in \texttt{gc\_stack\_threaded.ml}. In this design, C
-owns the mutator metadata, and the OxCaml service thread performs only the
-collection logic when it receives a command.
-
-This design is motivated by stack allocation: values allocated on a stack cannot
-escape the region that owns them. A persistent service loop gives the collector
-a long-lived execution region for repeated collection work.
-
-\section{Benchmark Methodology}
-
-\subsection{Workload}
-
-The benchmark is an allocation-heavy binary-tree workload included in
-\texttt{Alloc-free-gc/benchmarks}. Each worker builds:
-
-\begin{itemize}
-  \item one stretch tree of depth \(\texttt{max\_depth}+1\),
-  \item one long-lived tree of depth \(\texttt{max\_depth}\), and
-  \item many temporary trees at even depths from 4 to \(\texttt{max\_depth}\).
-\end{itemize}
-
-Each tree node has left and right child fields plus a pointer to a 128-word data
-array. This creates a mixture of short-lived temporary objects and long-lived
-reachable objects. Correctness is checked by traversing trees and computing
-node-count checksums.
-
-\subsection{Benchmark Matrix}
+\subsection{Experimental Setup}
 
 The main benchmark driver is
-\texttt{Alloc-free-gc/benchmarking/run\_gc\_benchmark.sh}. The checked-in
-result matrix uses:
+\texttt{benchmarking/run\_gc\_benchmark.sh}. It rebuilds
+\texttt{binary\_tree\_multithreaded\_test} once per collector variant and records
+elapsed wall-clock time. The checked-in result matrix uses:
 
-\begin{itemize}
-  \item depths: 11, 12, 13, and 14;
-  \item mutator thread counts: 1 through 8;
-  \item variants: \texttt{normal}, \texttt{zero}, \texttt{zero\_offheap},
+\begin{itemize}[leftmargin=*]
+  \item depths 11, 12, 13, and 14;
+  \item mutator thread counts 1 through 8;
+  \item variants \texttt{normal}, \texttt{zero}, \texttt{zero\_offheap},
   \texttt{zero\_offheap\_threaded}, and \texttt{zero\_stack\_threaded};
-  \item repetitions: 1 per configuration.
+  \item one run per configuration.
 \end{itemize}
 
-The plotting script writes summary statistics and speedup ratios to
-\texttt{Alloc-free-gc/benchmarking/benchmark\_plots}. Because the checked-in
-data have \(n=1\) for each configuration, standard deviations are not meaningful.
-The results are still useful for directional analysis, but strong claims require
-additional repeated runs.
+The plotting script \texttt{benchmarking/plot\_gc\_benchmark.py} produces
+per-depth time plots, summary statistics, and normal-relative speedup ratios.
+Since the checked-in data have one run per configuration, the evaluation should
+be read as directional. Repeated measurements are required for strong
+quantitative claims.
 
-\section{Pilot Benchmark}
+\subsection{Pilot Benchmark}
 
-An older pilot result set compares only \texttt{normal} and \texttt{zero}. It is
-included because it captures the first measurement of whether zero-allocation
-annotations helped end-to-end runtime.
+An older pilot run compared only the normal OCaml and zero-allocation OxCaml
+collectors. It is included because it was the first measurement of whether
+zero-allocation annotations helped end-to-end runtime.
 
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.72\textwidth]{pilot_normal_vs_zero.png}
-\caption{Pilot benchmark comparing the normal OCaml collector and the
-zero-allocation OxCaml collector.}
-\label{fig:pilot}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.75\linewidth]{pilot_normal_vs_zero.png}
+  \caption{Pilot benchmark comparing the normal OCaml collector and the
+  zero-allocation OxCaml collector.}
+  \label{fig:pilot}
 \end{figure}
 
-\begin{table}[H]
+\begin{table}[h]
 \centering
-\caption{Pilot benchmark: normal versus zero. Times are seconds. Ratio is
-normal/zero, so values above 1.0 favor the zero-allocation collector.}
+\caption{Pilot benchmark summary. Ratio is normal/zero, so values above 1.0
+favor the zero-allocation collector.}
 \label{tab:pilot}
 \begin{tabular}{rrrrr}
 \toprule
@@ -270,95 +284,76 @@ Depth & Threads & Normal & Zero & Ratio \\
 10 & 2 & 0.56 & 0.53 & 1.057 \\
 10 & 4 & 1.17 & 1.19 & 0.983 \\
 10 & 8 & 2.72 & 2.92 & 0.932 \\
-12 & 1 & 0.92 & 1.04 & 0.885 \\
-12 & 2 & 1.63 & 1.63 & 1.000 \\
 12 & 4 & 5.79 & 5.63 & 1.028 \\
-12 & 8 & 14.73 & 14.66 & 1.005 \\
-13 & 1 & 1.45 & 1.46 & 0.993 \\
 13 & 2 & 3.66 & 2.97 & 1.232 \\
-13 & 4 & 11.44 & 11.01 & 1.039 \\
 13 & 8 & 32.51 & 31.02 & 1.048 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 The pilot mean over its 12 configurations was 6.403 seconds for
-\texttt{normal} and 6.198 seconds for \texttt{zero}. This is a small aggregate
-improvement, but the per-configuration behavior is mixed: \texttt{zero} is
-slower at several smaller configurations and faster at several larger ones.
+\texttt{normal} and 6.198 seconds for \texttt{zero}. The result suggested that
+zero-allocation annotations could help, especially at larger configurations,
+but not uniformly.
 
-\section{Main Benchmark Results}
+\subsection{Main Benchmark Results}
 
-\subsection{Aggregate Results}
-
-\begin{table}[H]
+\begin{table}[h]
 \centering
 \caption{Aggregate timing over 32 configurations per variant. Mean is the
 arithmetic mean of per-configuration elapsed time.}
 \label{tab:aggregate}
 \begin{tabular}{lrrrr}
 \toprule
-Variant & Mean time (s) & Min (s) & Max (s) & Faster than normal \\
+Variant & Mean (s) & Min (s) & Max (s) & Faster than normal \\
 \midrule
 \texttt{normal} & 5.127 & 0.25 & 28.69 & baseline \\
-\texttt{zero} & 5.038 & 0.26 & 26.79 & 16 / 32 configs \\
-\texttt{zero\_offheap} & 4.914 & 0.21 & 26.68 & 21 / 32 configs \\
-\texttt{zero\_offheap\_threaded} & 4.919 & 0.23 & 26.11 & 17 / 32 configs \\
-\texttt{zero\_stack\_threaded} & 5.013 & 0.24 & 30.42 & 20 / 32 configs \\
+\texttt{zero} & 5.038 & 0.26 & 26.79 & 16 / 32 \\
+\texttt{zero\_offheap} & 4.914 & 0.21 & 26.68 & 21 / 32 \\
+\texttt{zero\_offheap\_threaded} & 4.919 & 0.23 & 26.11 & 17 / 32 \\
+\texttt{zero\_stack\_threaded} & 5.013 & 0.24 & 30.42 & 20 / 32 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 The best aggregate mean is from \texttt{zero\_offheap}. The threaded off-heap
 variant is very close, and the stack-threaded variant is also slightly faster
-than the normal baseline on the aggregate mean. The largest aggregate gap is
-between \texttt{normal} and \texttt{zero\_offheap}, about 4.2 percent of the
-normal mean. This is not large enough to justify a strong claim from single-run
-data, but it is a meaningful direction for further measurement.
+than the normal baseline on aggregate mean. The largest aggregate gap is only
+about 4.2 percent of the normal mean, so it should not be overstated.
 
-\subsection{Runtime Curves}
-
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.48\textwidth]{time_vs_threads_depth_11.png}
-\includegraphics[width=0.48\textwidth]{time_vs_threads_depth_12.png}
-\includegraphics[width=0.48\textwidth]{time_vs_threads_depth_13.png}
-\includegraphics[width=0.48\textwidth]{time_vs_threads_depth_14.png}
-\caption{Elapsed time versus mutator threads for depths 11--14.}
-\label{fig:time-curves}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.48\linewidth]{time_vs_threads_depth_11.png}
+  \includegraphics[width=0.48\linewidth]{time_vs_threads_depth_12.png}
+  \includegraphics[width=0.48\linewidth]{time_vs_threads_depth_13.png}
+  \includegraphics[width=0.48\linewidth]{time_vs_threads_depth_14.png}
+  \caption{Elapsed time versus mutator threads for depths 11--14.}
+  \label{fig:time-curves}
 \end{figure}
 
-\begin{figure}[H]
-\centering
-\includegraphics[width=0.92\textwidth]{normal_relative_speedup.png}
-\caption{Normal/variant time ratios. Values above 1.0 mean the variant is
-faster than the normal OCaml baseline.}
-\label{fig:speedup}
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.88\linewidth]{normal_relative_speedup.png}
+  \caption{Normal/variant time ratios. Values above 1.0 mean the variant is
+  faster than the normal OCaml baseline.}
+  \label{fig:speedup}
 \end{figure}
 
-\subsection{Per-depth Observations}
+\subsection{Discussion}
 
-At depth 11, runtimes are small and differences are noisy. The stack-threaded
-and off-heap variants perform well in several configurations, but the baseline
-normal collector remains competitive.
+The plain \texttt{zero} variant is faster in exactly half of the measured
+configurations. This means that zero-allocation annotations alone are not a
+universal win. Total elapsed time includes root scanning, C stub calls, object
+copying bandwidth, thread coordination, and benchmark scheduling.
 
-At depth 12, the best variant changes across thread counts. The threaded
-off-heap collector is best at 2 and 7 threads, off-heap is best at 1 and 4
-threads, and the plain zero-allocation collector is best at 6 threads. This
-suggests that the overheads being measured are not dominated by one simple
-factor.
+The most promising variant is \texttt{zero\_offheap}. It is faster than normal
+in 21 of 32 configurations and has the lowest aggregate mean. This supports the
+hypothesis that persistent collector metadata should not necessarily live in the
+embedded OCaml heap.
 
-At depth 13, the normal collector wins at 1, 3, and 5 threads, while the
-threaded off-heap variant wins at 4, 6, and 8 threads. This is the clearest
-evidence that no single implementation strategy dominates the benchmark.
-
-At depth 14, the zero-allocation variants become more favorable at larger thread
-counts. The best results at 5, 6, 7, and 8 threads are from
-\texttt{zero\_stack\_threaded} or \texttt{zero\_offheap\_threaded}. At 8
-threads, however, \texttt{zero\_stack\_threaded} is worse than normal, showing
-that service-thread coordination can also regress.
-
-\section{Detailed Timing Table}
+Threaded collection is mixed. \texttt{zero\_offheap\_threaded} is strong in some
+larger configurations, but the service-thread designs add synchronization, and
+that synchronization can outweigh the benefit of a persistent execution context.
 
 \begin{longtable}{rrrrrrr}
 \caption{Main benchmark elapsed time by configuration. Times are seconds.}
@@ -406,101 +401,86 @@ Depth & Threads & Normal & Zero & Offheap & Offheap-thr & Stack-thr \\
 \bottomrule
 \end{longtable}
 
-\section{Analysis}
+% =============================================================================
+\section{Reflection on the Use of LLMs}
+\label{sec:llm}
+% =============================================================================
 
-\subsection{Zero-allocation Alone Is Not a Universal Win}
+\paragraph{Tools and models used.}
+I used ChatGPT/Codex during the project for code navigation, implementation
+planning, debugging, benchmark-script cleanup, plotting-script review, and
+report drafting. The LLM was also used to reorganize the repository into a more
+standalone shape and to convert benchmark results into tables and prose.
 
-The plain \texttt{zero} variant has a slightly better aggregate mean than
-\texttt{normal}, but it is faster in exactly half of the measured configurations.
-This means that zero-allocation annotations on the collection hot path are not
-by themselves enough to dominate ordinary OCaml. The likely reason is that total
-elapsed time includes more than OCaml allocation in the collector: root scanning,
-raw memory loads and stores through C stubs, object copying bandwidth, runtime
-coordination, and benchmark scheduling all contribute.
+\paragraph{What worked well.}
+The most useful assistance was mechanical but time-saving: comparing collector
+variants, summarizing benchmark CSVs, identifying which files were build
+artifacts, and generating LaTeX tables from result files. The LLM also helped
+explain how the zero-allocation and off-heap variants differed in terms of
+metadata ownership and runtime coordination.
 
-\subsection{Off-heap Metadata Is the Most Promising Change}
+\paragraph{What did not work.}
+The LLM was not reliable as a source of final truth for low-level runtime
+behavior. Some early descriptions over-emphasized reference implementations and
+made the report sound less independent than the actual project. This was caught
+by reviewing the generated report and checking whether the narrative matched
+the repository layout.
 
-\texttt{zero\_offheap} is the most consistent improvement in the checked-in
-matrix. It is faster than \texttt{normal} in 21 of 32 configurations and has the
-lowest mean runtime. This supports the design hypothesis that persistent
-collector metadata should not necessarily live in the embedded OCaml heap.
+\paragraph{What was surprising.}
+It was useful for quickly turning raw benchmark data into an interpretable
+story, but small wording choices mattered a lot. A report can become misleading
+if it describes the project as dependent on outside code rather than as a
+standalone implementation with its own runtime, benchmarks, and results.
 
-The improvement is still modest. Off-heap metadata reduces one source of
-overhead, but the collector still performs the same fundamental work: scan
-roots, copy objects, traverse reachable fields, and update pointers.
+\paragraph{What was difficult.}
+The LLM could not replace understanding of the collector invariants. Decisions
+about root updates, forwarding, stop-the-world coordination, and whether
+zero-allocation annotations were actually meaningful had to be checked against
+the code and benchmark behavior.
 
-\subsection{Threaded Collection Has Mixed Results}
+\paragraph{Your overall assessment.}
+The LLM was helpful for acceleration, documentation, and sanity checks, but the
+runtime design and performance interpretation still required manual validation.
+I would use it again, but only with code review and benchmark verification.
 
-\texttt{zero\_offheap\_threaded} is close to \texttt{zero\_offheap} in aggregate
-mean and is best in several larger configurations. This suggests that a
-persistent worker can help when per-collection runtime coordination would
-otherwise be costly.
+% =============================================================================
+\section{Conclusions}
+\label{sec:conclusions}
+% =============================================================================
 
-\texttt{zero\_stack\_threaded} is also often competitive, but it has the worst
-single result at depth 14 and 8 threads. That outlier matters: the service-thread
-design adds synchronization, and that synchronization can outweigh the benefit
-of stable stack-local collector state.
+The research question was whether an allocation-conscious OCaml/OxCaml
+semi-space collector can be competitive with a normal OCaml collector behind a
+shared C allocation fast path. The answer from the current evidence is yes, but
+with qualifications. The \texttt{zero\_offheap} variant has the best aggregate
+mean and beats the normal baseline in most configurations, but the improvement
+is small and the benchmark data are single-run.
 
-\subsection{Meaningful Result}
+The main limitation is measurement confidence. The next step is to rerun the
+full matrix with 5--10 repetitions per configuration and to separately record
+collection count, copied bytes, and GC pause time. That would make it possible
+to distinguish collector improvement from mutator scheduling noise and general
+runtime overhead.
 
-The meaningful result is not that one collector variant wins everywhere. The
-stronger conclusion is that an allocation-conscious OxCaml collector can be made
-competitive with an ordinary OCaml collector behind a C runtime ABI. Off-heap
-metadata appears to be the most useful optimization among the tested variants,
-while persistent worker-thread designs need more measurement before their value
-is clear.
+% =============================================================================
+\section*{Contributions}
+\label{sec:contributions}
+% =============================================================================
 
-\section{Threats to Validity}
+\begin{center}
+\begin{tabular}{@{}lcl@{}}
+\toprule
+\textbf{Member} & \textbf{Contribution (\%)} & \textbf{Main responsibilities} \\
+\midrule
+Aditya Sawant & 100\% & Runtime integration, collector variants, benchmarking, plots, report \\
+\midrule
+\textbf{Total} & \textbf{100\%} & \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-\begin{itemize}
-  \item Each checked-in configuration has one run. This prevents confidence
-  intervals and makes outliers difficult to classify.
-  \item The benchmark is one allocation-heavy binary-tree workload. Other
-  allocation patterns may produce different results.
-  \item The results measure total elapsed time, not isolated GC pause time.
-  Mutator work, scheduler behavior, and synchronization overhead are included.
-  \item Some variants differ in runtime coordination strategy as well as
-  collector metadata placement, so not every timing difference can be attributed
-  to one isolated mechanism.
-  \item The benchmark should be repeated with at least 5--10 runs per
-  configuration before making strong quantitative claims.
-\end{itemize}
-
-\section{Conclusion}
-
-\texttt{Alloc-free-gc} demonstrates that semi-space collection logic can be
-implemented in OCaml/OxCaml while remaining competitive in an allocation-heavy
-runtime benchmark. The normal OCaml baseline is already strong, and
-zero-allocation annotations alone do not guarantee a clear speedup. The most
-promising design is \texttt{zero\_offheap}, which stores persistent collector
-metadata outside the OCaml heap and achieves the best aggregate mean in the
-current result set.
-
-The current evidence supports continued development, but not a final
-performance claim. The next evaluation step should be repeated benchmarking with
-variance reporting and, ideally, separate instrumentation for total elapsed
-time, collection count, copied bytes, and GC pause time.
-
-\section*{Artifact Manifest}
-
-\begin{itemize}
-  \item Project source: \texttt{Alloc-free-gc/runtime.c},
-  \texttt{Alloc-free-gc/runtime.h}, \texttt{Alloc-free-gc/gc\_ffi.c}.
-  \item Collector variants: \texttt{Alloc-free-gc/gc\_normal.ml},
-  \texttt{Alloc-free-gc/gc.ml},
-  \texttt{Alloc-free-gc/gc\_zero\_offheap.ml},
-  \texttt{Alloc-free-gc/gc\_stack\_threaded.ml}.
-  \item Benchmarks: \texttt{Alloc-free-gc/benchmarks/binary\_tree.c},
-  \texttt{Alloc-free-gc/benchmarks/binary\_tree\_multithreaded.c}.
-  \item Benchmark driver:
-  \texttt{Alloc-free-gc/benchmarking/run\_gc\_benchmark.sh}.
-  \item Plotting script:
-  \texttt{Alloc-free-gc/benchmarking/plot\_gc\_benchmark.py}.
-  \item Main results:
-  \texttt{Alloc-free-gc/benchmarking/benchmark\_results.csv}.
-  \item Pilot results:
-  \texttt{Alloc-free-gc/benchmarking/results/gc\_benchmark\_summary.csv}.
-  \item Figures for this report: \texttt{report\_figures/*.png}.
-\end{itemize}
+% =============================================================================
+\bibliographystyle{plainurl}
+\bibliography{references}
+% =============================================================================
 
 \end{document}
