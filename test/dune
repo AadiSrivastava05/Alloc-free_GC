@@ -1,4 +1,0 @@
-(executable
- (name test_gc)
- (modules test_gc)
- (libraries allocation_free_gc threads unix))

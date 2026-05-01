@@ -1,208 +1,177 @@
-# allocation_free_gc
-
-Pure OxCaml implementation of two semi-space copying collectors:
-
-- `Alloc_free_gc`: fixed-footprint, zero-dynamic-allocation collector runtime.
-- `Dynamic_gc`: baseline collector that allows dynamic growth/allocation.
-
-All GC logic is implemented in OxCaml/OCaml modules (no C GC implementation).
-
----
-
-## 1) Project goal
-
-This project studies whether a semi-space collector can be made operationally allocation-free in its runtime path:
-
-- user object allocation, GC tracing, and copy/forwarding run from pre-reserved metadata and arenas,
-- synchronization avoids `Mutex` allocation-sensitive paths,
-- collector correctness holds for cycles and concurrent mutators,
-- a dynamic baseline exists for fair throughput comparison.
-
----
-
-## 2) Theory summary
-
-### 2.1 Semi-space copying model
-
-Heap memory is split into two equal logical regions:
-
-- **from-space**: currently active allocation region
-- **to-space**: destination during collection
-
-Allocation is bump-pointer in from-space.  
-Collection:
-
-1. copy all roots from from-space to to-space,
-2. breadth-first scan copied objects,
-3. copy transitively reachable children,
-4. flip spaces and continue allocation in the new from-space.
-
-### 2.2 Forwarding invariant
-
-For an object at source index `i`:
-
-- before moved: `from_space[i]` contains header,
-- after moved: `from_space[i] = 0` and `from_space[i+1] = new_ptr`.
-
-This gives idempotent copying and constant-time forwarding checks.
-
-### 2.3 Tagged value encoding
-
-The runtime uses OCaml-style tagging:
-
-- odd values = immediate integers,
-- even non-zero values = heap handles (encoded pointers).
-
-This prevents confusing integers with managed references while tracing.
-
-### 2.4 Why rooted allocation matters under concurrency
-
-In a moving GC, a freshly allocated object that is not yet rooted can be moved by a concurrent collection before the mutator publishes it.  
-To avoid this, the API includes `alloc_object_rooted`, which allocates and installs the object in a root slot as one critical operation.
-
----
-
-## 3) Allocation-free runtime design (`Alloc_free_gc`)
-
-### 3.1 Fixed footprint
-
-The allocation-free variant uses fixed arrays allocated once at startup:
-
-- `from_space`
-- `to_space`
-- `roots`
-
-No per-collection vectors, queues, or lists are allocated.
-
-### 3.2 Locking without `Mutex`
-
-`Alloc_free_gc` uses a spin lock based on atomics:
-
-- lock word: `Atomic.t int`
-- acquire: CAS loop
-- release: atomic store
-
-This avoids `Mutex.lock/unlock` calls that fail `[@zero_alloc]` checks in OxCaml.
-
-### 3.3 `[@zero_alloc]` checked hot paths
-
-The core collector path is annotated and checked:
-
-- `copy_value`
-- `collect_unlocked`
-- lock primitives
-- allocation fast path (`alloc_object` / rooted variant)
-
-If a checked function calls a potentially allocating primitive, OxCaml reports it at compile time.
-
-### 3.4 Root protocol
-
-Root slots are explicit and bounded.  
-Mutators must keep live handles in roots across potential collection points.
-
-API highlights:
-
-- `alloc_object`
-- `alloc_object_rooted`
-- `set_root` / `get_root` / `clear_root`
-- `collect`
-
----
-
-## 4) Dynamic baseline (`Dynamic_gc`)
-
-`Dynamic_gc` uses the same object model and collection semantics, but allows dynamic heap growth and standard lock usage.  
-It is intentionally less constrained and serves as a benchmark/control variant.
-
----
-
-## 5) “Stack heap” clarification
-
-You asked for “heap simulated in stack if possible”.
-
-In pure OxCaml/OCaml, a long-lived global collector arena cannot literally live on a function stack frame (it must outlive stack scopes).  
-What this project does instead is the nearest runtime-equivalent:
-
-- **fixed preallocated arena with stack-like bump discipline**
-- **no dynamic resizing in allocation-free variant**
-- **collector metadata and semispace traversal state kept in fixed memory**
-
-So the behavior is “stack-style region allocation” over a fixed static runtime arena.
-
----
-
-## 6) Correctness invariants
-
-At all times:
-
-1. `alloc_ptr` points to first free word in active space.
-2. all root handles are either `0` or valid encoded pointers.
-3. during collection, `scan_ptr <= free_ptr`.
-4. each copied object is copied exactly once (forwarding invariant).
-5. after flip, only to-space data is considered live.
-
----
-
-## 7) Repository layout
-
-- `src/gc_sig.ml` - shared collector interface
-- `src/alloc_free_gc.ml` - fixed-footprint allocation-free collector
-- `src/dynamic_gc.ml` - dynamic baseline collector
-- `src/regional_alloc_free_gc.ml` - locality-based regional collector API (`local`/`exclave_`)
-- `src/runtime_alloc_free.ml` - runtime wrapper for allocation-free variant
-- `src/runtime_dynamic.ml` - runtime wrapper for baseline variant
-- `test/test_gc.ml` - cycle, concurrency, exhaustion tests
-- `bench/bench_gc.ml` - throughput benchmark (1/2/4/8 domains)
-
-### 7.1 Regional local-runtime variant
-
-`Regional_alloc_free_gc` is a second allocation-free design where the runtime state is created by `make_runtime` with `exclave_ stack_` and used via an explicit runtime parameter.
-
-- Intended use: keep GC state in an enclosing region rather than module-global mutable state.
-- API style: `alloc_object_rooted rt ...`, `collect rt`, `set_field rt ...`.
-- This demonstrates OxCaml locality semantics for cross-frame local values (callee allocates into caller region).
-
----
-
-## 8) Build and run (WSL + OxCaml)
-
-Create switch:
-
-```bash
-opam switch create 5.2.0+ox --repos ox=git+https://github.com/oxcaml/opam-repository.git,default
-opam install dune
+# Alloc-free-gc
+
+`Alloc-free-gc` is an experimental garbage-collection runtime for a small
+OCaml-style language runtime. It evaluates how far a semi-space collector can be
+pushed when the collection path is implemented in OCaml/OxCaml while allocation
+and heap ownership remain in a compact C runtime layer.
+
+The project is intentionally self-contained: the runtime interface, collector
+variants, benchmark driver, and result plotting scripts live in this directory.
+The benchmark programs use an OCaml-style tagged value representation and the
+runtime API provided in this directory, so the collector implementation and
+evaluation can be built and understood as a standalone project.
+
+## What This Project Studies
+
+The main question is whether allocation-conscious OxCaml implementations can be
+competitive with a straightforward OCaml collector when embedded behind a C
+runtime ABI.
+
+The current variants are:
+
+| Variant | Build selector | Purpose |
+| --- | --- | --- |
+| Zero-alloc | `GC=zero` | OxCaml collector with zero-allocation checks on the hot collection path. |
+| Zero-alloc off-heap | `GC=zero_offheap` | Stores persistent collector metadata in malloc-backed memory outside the OCaml heap. |
+| Threaded off-heap | `GC=zero_offheap_threaded` | Runs the off-heap collector through a persistent sleeping GC worker thread. |
+| Stack-threaded | `GC=zero_stack_threaded` | Routes collection through a long-lived OxCaml service thread so stack-local collector state can live across repeated collections. |
+| Normal OCaml | `GC=normal` | Baseline collector written in ordinary OCaml without zero-allocation annotations. |
+
+All variants use the same C allocation fast path. The selected OCaml/OxCaml
+module is responsible for collection after allocation failure, so benchmarks
+compare collector/root-scanning implementation style rather than allocation FFI
+overhead.
+
+## Repository Layout
+
+```text
+.
+├── Makefile
+├── README.md
+├── runtime.c / runtime.h
+├── gc_ffi.c
+├── gc.ml
+├── gc_zero_offheap.ml
+├── gc_stack_threaded.ml
+├── gc_normal.ml
+├── mmtk-bindings/include/mmtk.h
+├── smoke_test.c
+├── benchmarks/
+│   ├── README.md
+│   ├── binary_tree.c
+│   └── binary_tree_multithreaded.c
+├── benchmarking/
+│   ├── README.md
+│   ├── run_gc_benchmark.sh
+│   ├── plot_gc_benchmark.py
+│   ├── benchmark_results.csv
+│   └── benchmark_plots/
+├── docs/
+│   ├── architecture.md
+│   └── results.md
 ```
 
-Build:
+Important files:
 
-```bash
-opam exec --switch=5.2.0+ox -- dune build
+- `runtime.c` / `runtime.h`: C runtime surface, value representation, root
+  stack, mutator lifecycle, allocation entry point, and stop-the-world
+  coordination.
+- `gc_ffi.c`: C ABI shim that embeds the OCaml/OxCaml runtime, exposes the
+  `mmtk_*` functions consumed by `runtime.c`, and owns the shared semi-space
+  heap and bump allocation state.
+- `gc.ml`: zero-allocation OxCaml semi-space collector with OCaml-managed
+  persistent metadata.
+- `gc_zero_offheap.ml`: zero-allocation OxCaml collector with persistent
+  metadata stored outside the OCaml heap.
+- `gc_stack_threaded.ml`: stack-threaded collector service loop.
+- `gc_normal.ml`: ordinary OCaml collector baseline.
+- `benchmarking/`: benchmark runner, plotting script, current result CSVs, and
+  generated plots.
+- `benchmarks/`: standalone benchmark programs built by the project Makefile.
+- `docs/`: architecture and result summaries.
+- `smoke_test.c`: compact runtime smoke test used by the default `make` target.
+
+## Requirements
+
+- Linux or WSL with `gcc`, `make`, and POSIX threads.
+- OxCaml / OCaml compiler available as `ocamlopt.opt`.
+- The project has been developed with the `5.2.0+ox` switch.
+- Python 3 for plotting.
+- `matplotlib` for plot generation.
+
+## Build
+
+Build the default zero-allocation collector and smoke test:
+
+```sh
+make
+./test
 ```
 
-Tests:
+Build a specific collector variant:
 
-```bash
-opam exec --switch=5.2.0+ox -- dune exec ./test/test_gc.exe
+```sh
+make GC=zero test
+make GC=zero_offheap test
+make GC=zero_offheap_threaded test
+make GC=zero_stack_threaded test
+make GC=normal test
 ```
 
-Benchmark:
+Build and run the binary-tree benchmark targets:
 
-```bash
-opam exec --switch=5.2.0+ox -- dune exec ./bench/bench_gc.exe
+```sh
+make GC=zero_offheap binary_tree_test binary_tree_multithreaded_test
+./binary_tree_test 16
+./binary_tree_multithreaded_test 14 4
 ```
 
-CSV output columns:
+## Benchmark
 
-- `collector`
-- `threads`
-- `seconds`
-- `throughput_ops_per_sec`
+Run the full benchmark matrix:
 
----
+```sh
+./benchmarking/run_gc_benchmark.sh
+```
 
-## 9) Current trade-offs
+Generate plots and summary CSVs:
 
-- allocation-free variant is bounded by fixed arena size.
-- explicit rooting is required for correctness across collection points.
-- spin locking is simple and allocation-safe, but may waste CPU under heavy contention.
-- dynamic variant is usually more flexible, sometimes faster at high thread counts.
+```sh
+python3 benchmarking/plot_gc_benchmark.py \
+  --csv benchmarking/benchmark_results.csv
+```
+
+See [`benchmarking/README.md`](benchmarking/README.md) for configurable depths,
+thread counts, repetitions, and variant subsets.
+
+## Current Results
+
+The checked-in benchmark artifacts show a modest but useful signal:
+
+- `zero_offheap` has the best aggregate mean in the current benchmark matrix.
+- `zero_stack_threaded` and `zero_offheap_threaded` are competitive on larger
+  depth/thread configurations.
+- Differences among OxCaml variants are small enough that repeated runs are
+  required before making strong claims.
+
+Useful artifacts:
+
+- `benchmarking/benchmark_results.csv`
+- `benchmarking/benchmark_plots/summary_stats.csv`
+- `benchmarking/benchmark_plots/normal_relative_speedup.csv`
+- `benchmarking/benchmark_plots/*.png`
+
+## Design Notes
+
+The runtime uses a semi-space heap with explicit root registration. Mutator
+threads push addresses of local pointer variables onto a thread-local root
+stack. During collection, the collector scans static roots, active mutator root
+stacks, and return-value roots, then performs Cheney-style traversal over
+objects copied into to-space.
+
+OxCaml zero-allocation annotations are used to keep bounded collector hot paths
+from allocating in the OCaml heap. The off-heap and stack-threaded variants
+experiment with reducing long-lived metadata pressure and making stack-local
+collector state practical across repeated collections.
+
+## Cleaning
+
+Remove local build products:
+
+```sh
+make clean
+```
+
+The `.gitignore` file excludes compiler outputs and local benchmark binaries so
+future commits can focus on source, documentation, scripts, and intentionally
+published result artifacts.
