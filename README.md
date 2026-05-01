@@ -1,5 +1,10 @@
 # Alloc-free-gc
 
+> ## Project Video
+>
+> Watch the full project explanation here:
+> **[Project video and walkthrough](https://drive.google.com/drive/folders/1czzkVebyv8pj0ziYPSLh13SqE3jmnHCB?usp=sharing)**
+
 Allocation-conscious semi-space garbage collection in OxCaml.
 
 This project implements a small C runtime with a stop-the-world semi-space heap
