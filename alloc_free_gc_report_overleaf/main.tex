@@ -52,19 +52,21 @@
 
 \begin{abstract}
 \texttt{Alloc-free-gc} is an independent experimental garbage-collection
-runtime for a small OCaml-style language implementation. The project studies
-whether semi-space copying collection can be implemented in OCaml/OxCaml while
-remaining competitive with a normal OCaml collector when heap ownership and the
-allocation fast path are kept in C. The implementation compares five collector
-variants: a normal OCaml collector, a zero-allocation OxCaml collector, an
-off-heap metadata zero-allocation collector, a threaded off-heap collector, and
-a stack-threaded collector service. On the checked-in benchmark matrix,
+runtime for a small OCaml-style language implementation. The central experiment
+is to test whether a garbage collector that avoids heap allocation during
+collection can outperform a normal OCaml collector. OxCaml was chosen because it
+provides zero-allocation checking and stack-oriented allocation semantics, which
+make it possible to write collector hot paths that use stack/local state instead
+of allocating ordinary OCaml heap objects. The implementation compares a normal
+OCaml semi-space collector against a family of allocation-free variants:
+\texttt{zero}, \texttt{zero\_offheap}, \texttt{zero\_offheap\_threaded}, and
+\texttt{zero\_stack\_threaded}. On the checked-in benchmark matrix,
 \texttt{zero\_offheap} has the best aggregate mean time, 4.914 seconds versus
-5.127 seconds for \texttt{normal}. The improvement is modest, and the data have
-one run per configuration, so the result is best read as directional rather
-than statistically conclusive. The main conclusion is that allocation-conscious
-OxCaml collection is viable, but zero-allocation annotations alone are not a
-universal win; metadata placement and runtime coordination also matter.
+5.127 seconds for \texttt{normal}. The plots show the expected pattern: the
+allocation-free variants often do slightly better, especially at larger
+workloads, but their extra FFI, metadata, and worker-thread coordination
+overheads sometimes erase the gain. Since each configuration has one run, the
+result is directional rather than statistically conclusive.
 \end{abstract}
 
 % =============================================================================
@@ -72,13 +74,19 @@ universal win; metadata placement and runtime coordination also matter.
 \label{sec:goals}
 % =============================================================================
 
-The goal of this project was to build and evaluate a small garbage-collection
-runtime in which the collector logic is written in OCaml/OxCaml rather than
-entirely in C. The project focuses on a stop-the-world semi-space copying
-collector, a design that is simple enough to implement completely while still
-exercising important runtime-system concerns: root discovery, object copying,
-pointer forwarding, heap-space swapping, and multi-threaded mutator
-coordination.
+The goal of this project was to answer a specific performance question: if the
+collector itself avoids heap allocation and uses stack/local state during
+collection, is it faster than a normal collector written in ordinary OCaml? This
+question motivated the choice of OxCaml. OxCaml supports zero-allocation checks
+and stack-oriented programming features, so it is a natural tool for building a
+collector whose hot path does not allocate into the OCaml heap while the
+collector is already trying to recover memory.
+
+The collector algorithm is a stop-the-world semi-space copying collector. This
+algorithm is simple enough to implement completely, but still exercises the
+runtime-system mechanisms that matter for the experiment: explicit root
+discovery, object copying, forwarding pointers, heap-space swapping, and
+multi-threaded mutator coordination.
 
 The project connects to CS6868 topics in two ways. First, the runtime uses
 threads, shared state, condition variables, and stop-the-world synchronization,
@@ -91,13 +99,15 @@ multiple execution contexts.
 The research question is:
 
 \begin{quote}
-Can a semi-space garbage collector implemented in allocation-conscious
-OCaml/OxCaml be competitive with a normal OCaml implementation when all variants
-share the same C allocation fast path?
+Does a semi-space collector written using OxCaml's zero-allocation and
+stack-oriented features run faster than a normal OCaml collector when both share
+the same C heap and allocation fast path?
 \end{quote}
 
-The secondary question is which optimization matters most: local zero-allocation
-coding style, off-heap metadata, or persistent worker-thread execution.
+The secondary question is why the answer is not uniform: when the
+allocation-free collector is faster, is the gain large enough to overcome the
+extra overheads introduced by FFI calls, off-heap metadata access, and
+persistent worker-thread coordination?
 
 % =============================================================================
 \section{Background}
@@ -160,6 +170,21 @@ the requesting mutator marks a GC request and waits until all active mutators
 reach a polling or allocation point. The selected collector variant then runs
 with no concurrent mutation.
 
+\subsection{Why OxCaml and Stack-oriented Allocation}
+
+A collector is a particularly sensitive place to allocate ordinary heap objects:
+it runs exactly when the runtime has failed to satisfy an allocation request.
+If the collector implementation itself allocates on the managed heap, then its
+bookkeeping can perturb the measurement and may introduce additional runtime
+pressure. The purpose of using OxCaml was therefore not merely to reimplement a
+collector in another language; it was to use OxCaml's zero-allocation checking
+and stack-oriented semantics to keep the collector hot path allocation-free.
+
+The ideal target is a collector whose temporary bookkeeping lives in bounded
+locals or stack-backed state, while persistent metadata either remains outside
+the OCaml heap or is accessed without allocating. The variants in this project
+are successive approximations of that target.
+
 % =============================================================================
 \section{Tasks Undertaken}
 \label{sec:tasks}
@@ -186,18 +211,25 @@ The implemented collector variants are:
 \paragraph{Normal OCaml collector.}
 \texttt{gc\_normal.ml} is the baseline. It implements the same semi-space
 algorithm using ordinary OCaml references and arrays for metadata. This gives a
-direct comparison point for the allocation-conscious variants.
+direct comparison point for the allocation-free hypothesis: if ordinary OCaml
+allocation in collector bookkeeping is not a significant cost, this baseline
+should be hard to beat.
 
 \paragraph{Zero-allocation OxCaml collector.}
 \texttt{gc.ml}, selected by \texttt{GC=zero}, rewrites the hot collection path
 with OxCaml zero-allocation annotations. The copy function returns both the
-updated pointer and next free pointer without allocating an OCaml pair.
+updated pointer and next free pointer without allocating an OCaml pair. This is
+the first direct test of the main idea: make the collector's active copying and
+scanning path allocation-free.
 
 \paragraph{Off-heap metadata collector.}
 \texttt{gc\_zero\_offheap.ml}, selected by \texttt{GC=zero\_offheap}, moves
 persistent metadata into malloc-backed memory. Static root slots, mutator root
 stack pointers, stack-index pointers, return-root pointers, active-thread flags,
-and counters are accessed through no-allocation C stubs.
+and counters are accessed through no-allocation C stubs. This was added because
+the plain \texttt{zero} collector still keeps long-lived metadata in OCaml
+arrays; moving that state off-heap makes the implementation closer to the
+intended allocation-free collector model.
 
 \paragraph{Threaded off-heap collector.}
 \texttt{GC=zero\_offheap\_threaded} uses the same off-heap collector but runs
@@ -208,7 +240,10 @@ wakes the worker after mutators have stopped.
 \texttt{gc\_stack\_threaded.ml}, selected by
 \texttt{GC=zero\_stack\_threaded}, runs collection inside a long-lived OxCaml
 service loop. C owns mutator metadata; the OxCaml service thread performs only
-collection when it receives a command.
+collection when it receives a command. This variant most directly targets the
+``use stack space for GC work'' idea: the collector logic runs in a persistent
+worker frame, so stack-local state can remain within a long-lived collection
+service rather than being recreated through normal callback paths.
 
 \subsection{Testing and Verification}
 
@@ -257,7 +292,7 @@ Since the checked-in data have one run per configuration, the evaluation should
 be read as directional. Repeated measurements are required for strong
 quantitative claims.
 
-\subsection{Pilot Benchmark}
+\subsection{Pilot Benchmark: Does Zero-allocation Help?}
 
 An older pilot run compared only the normal OCaml and zero-allocation OxCaml
 collectors. It is included because it was the first measurement of whether
@@ -292,11 +327,16 @@ Depth & Threads & Normal & Zero & Ratio \\
 \end{table}
 
 The pilot mean over its 12 configurations was 6.403 seconds for
-\texttt{normal} and 6.198 seconds for \texttt{zero}. The result suggested that
-zero-allocation annotations could help, especially at larger configurations,
-but not uniformly.
+\texttt{normal} and 6.198 seconds for \texttt{zero}. This supports the initial
+hypothesis only weakly. The allocation-free collector is not automatically
+faster at small depths: for example, at depth 10 with 1 and 8 threads it is
+slower than \texttt{normal}. But at larger depth/thread combinations, such as
+depth 13 with 2, 4, and 8 threads, \texttt{zero} is faster. This suggests that
+removing collector-side heap allocation can help when the workload is large
+enough, but the benefit must first overcome fixed overheads from callback
+crossing, root metadata access, and raw memory operations.
 
-\subsection{Main Benchmark Results}
+\subsection{Main Benchmark Results: Allocation-free Family vs. Normal GC}
 
 \begin{table}[h]
 \centering
@@ -316,10 +356,13 @@ Variant & Mean (s) & Min (s) & Max (s) & Faster than normal \\
 \end{tabular}
 \end{table}
 
-The best aggregate mean is from \texttt{zero\_offheap}. The threaded off-heap
-variant is very close, and the stack-threaded variant is also slightly faster
-than the normal baseline on aggregate mean. The largest aggregate gap is only
-about 4.2 percent of the normal mean, so it should not be overstated.
+The aggregate result answers the main question cautiously. Every
+allocation-free variant except the plain \texttt{zero} variant's consistency
+problem is competitive with \texttt{normal}, and the best mean is from
+\texttt{zero\_offheap}. The improvement from 5.127 seconds to 4.914 seconds is
+about 4.2 percent. That is meaningful enough to suggest that avoiding
+collector-side heap allocation can pay off, but not large enough to claim that
+stack/zero-allocation semantics dominate all other costs.
 
 \begin{figure}[h]
   \centering
@@ -339,21 +382,59 @@ about 4.2 percent of the normal mean, so it should not be overstated.
   \label{fig:speedup}
 \end{figure}
 
-\subsection{Discussion}
+\subsection{Discussion and Inferences from the Plots}
 
+The plots show that the original hypothesis is partly true. The
+allocation-free family often sits slightly below the normal collector, but the
+lines are close and cross several times. That shape is important: it means the
+experiment did not uncover a large algorithmic speedup, but it did show that
+collector-side heap allocation is one contributor to total runtime.
+
+\paragraph{Zero-allocation alone helps only when the workload is large enough.}
 The plain \texttt{zero} variant is faster in exactly half of the measured
-configurations. This means that zero-allocation annotations alone are not a
-universal win. Total elapsed time includes root scanning, C stub calls, object
-copying bandwidth, thread coordination, and benchmark scheduling.
+configurations. At smaller depths, the cost saved by avoiding heap allocation in
+the collector is comparable to or smaller than the overhead of the OxCaml/C
+callback path and no-allocation memory stubs. At larger configurations, such as
+several depth-14 cases, \texttt{zero} becomes faster than \texttt{normal}. This
+matches the expected threshold behavior: fixed overheads dominate small runs,
+while allocation-free collection has more opportunity to pay off in larger
+runs.
 
+\paragraph{Off-heap metadata is the clearest improvement.}
 The most promising variant is \texttt{zero\_offheap}. It is faster than normal
-in 21 of 32 configurations and has the lowest aggregate mean. This supports the
-hypothesis that persistent collector metadata should not necessarily live in the
-embedded OCaml heap.
+in 21 of 32 configurations and has the lowest aggregate mean. This supports a
+more precise version of the hypothesis: it is not enough for the copy loop to be
+zero-allocation if persistent root and thread metadata still live in OCaml
+arrays. Moving metadata out of the OCaml heap makes the collector closer to the
+intended model, where GC bookkeeping does not allocate or depend on managed heap
+state.
 
-Threaded collection is mixed. \texttt{zero\_offheap\_threaded} is strong in some
-larger configurations, but the service-thread designs add synchronization, and
-that synchronization can outweigh the benefit of a persistent execution context.
+\paragraph{The stack-threaded design exposes the cost of making stack state
+long-lived.}
+\texttt{zero\_stack\_threaded} was intended to make stack-local collector state
+practical by running collection inside a persistent service loop. It performs
+well in several configurations: at depth 14 with 1, 4, and 5 threads it is the
+fastest variant. However, it is also the slowest at depth 14 with 8 threads
+(30.42 seconds versus 28.69 for \texttt{normal}). This is the clearest example
+of overheads adding up. The service-thread command queue and synchronization
+can erase the benefit of stack-local state when mutator coordination pressure is
+high.
+
+\paragraph{Threaded off-heap is useful at larger high-thread cases.}
+\texttt{zero\_offheap\_threaded} is strongest near the larger end of the matrix:
+it is the fastest variant at depth 13 with 4, 6, and 8 threads, and at depth 14
+with 6, 7, and 8 threads. This suggests that a persistent worker can help when
+the collection workload is large enough to amortize the worker coordination
+cost. It also explains why the threaded variant is not consistently best at
+smaller depths.
+
+\paragraph{Overall inference.}
+The meaningful result is therefore not ``allocation-free GC is always faster.''
+The more accurate conclusion is: an allocation-free collector built using
+OxCaml's zero-allocation/stack-oriented features can be slightly faster than a
+normal OCaml collector, but only when the saved heap-allocation overhead exceeds
+the extra overhead introduced by FFI boundaries, off-heap metadata access, and
+thread/service coordination.
 
 \begin{longtable}{rrrrrrr}
 \caption{Main benchmark elapsed time by configuration. Times are seconds.}
@@ -409,34 +490,38 @@ Depth & Threads & Normal & Zero & Offheap & Offheap-thr & Stack-thr \\
 \paragraph{Tools and models used.}
 I used ChatGPT/Codex during the project for code navigation, implementation
 planning, debugging, benchmark-script cleanup, plotting-script review, and
-report drafting. The LLM was also used to reorganize the repository into a more
+report drafting. The LLM was also used to reorganize the project into a more
 standalone shape and to convert benchmark results into tables and prose.
 
 \paragraph{What worked well.}
 The most useful assistance was mechanical but time-saving: comparing collector
 variants, summarizing benchmark CSVs, identifying which files were build
 artifacts, and generating LaTeX tables from result files. The LLM also helped
-explain how the zero-allocation and off-heap variants differed in terms of
-metadata ownership and runtime coordination.
+reframe the evaluation around the actual hypothesis: whether OxCaml's
+zero-allocation and stack-oriented features reduce collector overhead compared
+with a normal OCaml implementation.
 
 \paragraph{What did not work.}
 The LLM was not reliable as a source of final truth for low-level runtime
 behavior. Some early descriptions over-emphasized reference implementations and
-made the report sound less independent than the actual project. This was caught
-by reviewing the generated report and checking whether the narrative matched
-the repository layout.
+later drafts described the project as a collection of variants rather than as a
+focused test of allocation-free GC. This was caught by reviewing whether the
+report explained why OxCaml was used in the first place.
 
 \paragraph{What was surprising.}
 It was useful for quickly turning raw benchmark data into an interpretable
 story, but small wording choices mattered a lot. A report can become misleading
-if it describes the project as dependent on outside code rather than as a
-standalone implementation with its own runtime, benchmarks, and results.
+if it describes the project as a loose set of attempted variants rather than as
+a focused experiment with a clear hypothesis, benchmarks, and results.
 
 \paragraph{What was difficult.}
 The LLM could not replace understanding of the collector invariants. Decisions
 about root updates, forwarding, stop-the-world coordination, and whether
 zero-allocation annotations were actually meaningful had to be checked against
-the code and benchmark behavior.
+the code and benchmark behavior. In particular, interpreting why an
+allocation-free variant can be slower required understanding the overheads of
+FFI calls, off-heap metadata access, and persistent service-thread
+synchronization.
 
 \paragraph{Your overall assessment.}
 The LLM was helpful for acceleration, documentation, and sanity checks, but the
@@ -448,12 +533,21 @@ I would use it again, but only with code review and benchmark verification.
 \label{sec:conclusions}
 % =============================================================================
 
-The research question was whether an allocation-conscious OCaml/OxCaml
-semi-space collector can be competitive with a normal OCaml collector behind a
-shared C allocation fast path. The answer from the current evidence is yes, but
-with qualifications. The \texttt{zero\_offheap} variant has the best aggregate
-mean and beats the normal baseline in most configurations, but the improvement
-is small and the benchmark data are single-run.
+The research question was whether a collector written to avoid heap allocation,
+using OxCaml's zero-allocation and stack-oriented features, can outperform a
+normal OCaml collector behind a shared C allocation fast path. The answer from
+the current evidence is: slightly, but not universally. The
+\texttt{zero\_offheap} variant has the best aggregate mean and beats the normal
+baseline in most configurations, while \texttt{zero\_stack\_threaded} shows
+that making stack-local collector state practical can also introduce
+synchronization overhead.
+
+The main lesson is that allocation-free GC is a useful optimization direction,
+not a free win. It reduces one source of overhead, but total runtime also
+depends on root scanning, raw memory access through stubs, copied object volume,
+and mutator/worker coordination. The plots are consistent with this: the
+allocation-free variants often do better, but the advantage is small and
+occasionally reversed.
 
 The main limitation is measurement confidence. The next step is to rerun the
 full matrix with 5--10 repetitions per configuration and to separately record
