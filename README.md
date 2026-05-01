@@ -3,7 +3,7 @@
 > ## Project Video
 >
 > Watch the full project explanation here:
-> **[Project video and walkthrough](https://drive.google.com/drive/folders/1czzkVebyv8pj0ziYPSLh13SqE3jmnHCB?usp=sharing)**
+> **[Project video](https://drive.google.com/drive/folders/1czzkVebyv8pj0ziYPSLh13SqE3jmnHCB?usp=sharing)**
 
 This repository contains a research mini-project on allocation-conscious garbage
 collection in OxCaml. The project asks whether a semi-space copying collector
