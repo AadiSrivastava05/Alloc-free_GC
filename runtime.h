@@ -1,26 +1,29 @@
+#ifndef RUNTIME_H
+#define RUNTIME_H
+
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <stdbool.h>
-#include "mmtk-bindings/include/mmtk.h"
+#include <stdint.h>
 
-#define HEAP_SIZE (4096 * 1024 * 32)
-#define MIN_ALIGNMENT 2
-#define PAGE_BYTES 4096
-#define ROOT_STACK_SIZE (1 << 20)
+#define HEAP_SIZE_BYTES (1L << 27)   /* 128 MiB per semi-space */
+#define ROOT_STACK_SIZE (1 << 18)
+#define MAX_STATIC_ROOTS 1024
+#define MAX_THREADS 128
 
-/* OCaml-style field access and tagging */
-#define Field(ptr, offset) ((long *)ptr)[offset] 
-#define long2val(x) ((x << 1) + 1)
-#define val2long(x) (x >> 1)
+/* OCaml-style tagging: low bit = 1 -> integer, low bit = 0 -> heap pointer.
+ * Pointer points at object body; header is one word before the body. */
+#define Field(ptr, off) ((long *)(ptr))[off]
+#define long2val(x) ((((long)(x)) << 1) + 1)
+#define val2long(x) (((long)(x)) >> 1)
 
-/* return handling */
-#define toycaml_return(x)           \
-    return (typeof(x))toycaml_return_with_val((long*)(x))
-#define toycaml_frame toycaml_new_frame()
+/* Root frame helpers (used by user-level C code) */
+#define alloc_free_frame alloc_free_new_frame()
+#define alloc_free_return(x) \
+    return (typeof(x))alloc_free_return_with_val((long *)(x))
 
-// below are for semi_space_gc.c
 typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t gc_off;
@@ -32,41 +35,59 @@ typedef struct {
     bool world_has_stopped;
 } STW_State;
 
-/* Internal thread wrapper to bind mutator */
-void *thread_entry_point(void *func_ptr);
+extern STW_State stw_state;
 
-/* Spawns a domain and increments thread count */
+/* Per-thread state (defined in runtime.c) */
+extern __thread long **root_stack[ROOT_STACK_SIZE];
+extern __thread long stack_idx;
+extern __thread long current_frame_stack_sz[ROOT_STACK_SIZE];
+extern __thread long current_frame;
+extern __thread long *gc_retval;
+
+/* Thread-registry shared between runtime and gc_bridge */
+typedef struct {
+    long ***root_stack_ptr;
+    long *stack_idx_ptr;
+    long **gc_retval_ptr;
+    atomic_bool is_active;
+} ThreadRegistry;
+
+extern ThreadRegistry registry[MAX_THREADS];
+extern atomic_int registered_threads;
+
+/* Static (global) roots */
+extern void *static_roots[MAX_STATIC_ROOTS];
+extern atomic_int static_root_count;
+
+/* Heap */
+extern long *from_heap;
+extern long *to_heap;
+extern long heap_sz;        /* per-semi-space size in bytes */
+extern long cur_heap_ptr;   /* offset (bytes) into from_heap */
+
+/* User-facing API */
+void init_heap(void);
+long *gc_alloc(long len, long tag);
+
 pthread_t domain_spawn(void *function);
-
-/* Joins a domain and decrements thread count */
 void domain_join(pthread_t pid);
 
-/* Captures current RSP */
-long *get_stack_ptr();
-
-/* Initializes MMTk and main mutator */
-void init_heap();
-
-/* Allocates object with tag and initializes fields */
-long *caml_alloc(long len, long tag);
-
-/* Registers a static pointer as a GC root */
 void make_static_root(long **ptr_to_var);
+void make_root(long **ptr_to_var);
+void make_return_root(long **ptr_to_var);
 
-/* Blocks thread if GC is requested (STW) */
-void toycaml_return_handler();
+void alloc_free_new_frame(void);
+void alloc_free_return_handler(void);
+long *alloc_free_return_with_val(long *val);
 
-/* Blocks thread if GC is requested, returns updated pointer if GC moved it */
-long* toycaml_return_with_val(long* val);
+void poll_for_gc(void);
 
-/* Adds frame specific roots */
-void make_root(long** ptr);
+/* Implemented in gc_bridge.c: invoked by allocator on heap exhaustion
+ * (assumes the world is already stopped). */
+void run_collection(void);
 
-/* Adds return value root */
-void make_return_root(long** ptr);
+/* Implemented in gc_bridge.c: starts long-lived OCaml service if a
+ * variant requires one (no-op for variants that don't). */
+void start_gc_service(void);
 
-/* Frame handler */
-void toycaml_new_frame();
-
-/* Poll for GC */
-void poll_for_gc();
+#endif

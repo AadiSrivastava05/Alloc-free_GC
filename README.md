@@ -1,177 +1,98 @@
 # Alloc-free-gc
 
-`Alloc-free-gc` is an experimental garbage-collection runtime for a small
-OCaml-style language runtime. It evaluates how far a semi-space collector can be
-pushed when the collection path is implemented in OCaml/OxCaml while allocation
-and heap ownership remain in a compact C runtime layer.
+Allocation-conscious semi-space garbage collection in OxCaml.
 
-The project is intentionally self-contained: the runtime interface, collector
-variants, benchmark driver, and result plotting scripts live in this directory.
-The benchmark programs use an OCaml-style tagged value representation and the
-runtime API provided in this directory, so the collector implementation and
-evaluation can be built and understood as a standalone project.
+This project implements a small C runtime with a stop-the-world semi-space heap
+and five OCaml/OxCaml collector variants. The goal is to compare ordinary OCaml
+collector bookkeeping against progressively allocation-free, C-side, threaded,
+and stack-threaded designs while keeping the heap, object layout, root tracking,
+and benchmark workload fixed.
 
-## What This Project Studies
+## Layout
 
-The main question is whether allocation-conscious OxCaml implementations can be
-competitive with a straightforward OCaml collector when embedded behind a C
-runtime ABI.
-
-The current variants are:
-
-| Variant | Build selector | Purpose |
-| --- | --- | --- |
-| Zero-alloc | `GC=zero` | OxCaml collector with zero-allocation checks on the hot collection path. |
-| Zero-alloc off-heap | `GC=zero_offheap` | Stores persistent collector metadata in malloc-backed memory outside the OCaml heap. |
-| Threaded off-heap | `GC=zero_offheap_threaded` | Runs the off-heap collector through a persistent sleeping GC worker thread. |
-| Stack-threaded | `GC=zero_stack_threaded` | Routes collection through a long-lived OxCaml service thread so stack-local collector state can live across repeated collections. |
-| Normal OCaml | `GC=normal` | Baseline collector written in ordinary OCaml without zero-allocation annotations. |
-
-All variants use the same C allocation fast path. The selected OCaml/OxCaml
-module is responsible for collection after allocation failure, so benchmarks
-compare collector/root-scanning implementation style rather than allocation FFI
-overhead.
-
-## Repository Layout
-
-```text
-.
-├── Makefile
-├── README.md
-├── runtime.c / runtime.h
-├── gc_ffi.c
-├── gc.ml
-├── gc_zero_offheap.ml
-├── gc_stack_threaded.ml
-├── gc_normal.ml
-├── mmtk-bindings/include/mmtk.h
-├── smoke_test.c
-├── benchmarks/
-│   ├── README.md
-│   ├── binary_tree.c
-│   └── binary_tree_multithreaded.c
-├── benchmarking/
-│   ├── README.md
-│   ├── run_gc_benchmark.sh
-│   ├── plot_gc_benchmark.py
-│   ├── benchmark_results.csv
-│   └── benchmark_plots/
-├── docs/
-│   ├── architecture.md
-│   └── results.md
-```
-
-Important files:
-
-- `runtime.c` / `runtime.h`: C runtime surface, value representation, root
-  stack, mutator lifecycle, allocation entry point, and stop-the-world
-  coordination.
-- `gc_ffi.c`: C ABI shim that embeds the OCaml/OxCaml runtime, exposes the
-  `mmtk_*` functions consumed by `runtime.c`, and owns the shared semi-space
-  heap and bump allocation state.
-- `gc.ml`: zero-allocation OxCaml semi-space collector with OCaml-managed
-  persistent metadata.
-- `gc_zero_offheap.ml`: zero-allocation OxCaml collector with persistent
-  metadata stored outside the OCaml heap.
-- `gc_stack_threaded.ml`: stack-threaded collector service loop.
-- `gc_normal.ml`: ordinary OCaml collector baseline.
-- `benchmarking/`: benchmark runner, plotting script, current result CSVs, and
-  generated plots.
-- `benchmarks/`: standalone benchmark programs built by the project Makefile.
-- `docs/`: architecture and result summaries.
-- `smoke_test.c`: compact runtime smoke test used by the default `make` target.
-
-## Requirements
-
-- Linux or WSL with `gcc`, `make`, and POSIX threads.
-- OxCaml / OCaml compiler available as `ocamlopt.opt`.
-- The project has been developed with the `5.2.0+ox` switch.
-- Python 3 for plotting.
-- `matplotlib` for plot generation.
+- `runtime.c`, `runtime.h` - C runtime, heap allocation, roots, thread registry, stop-the-world coordination.
+- `gc_bridge.c` - C/OxCaml bridge, noalloc primitives, collector dispatch, worker-thread coordination.
+- `gc_prims.ml` - shared noalloc external declarations and helper functions.
+- `gc_normal.ml` - baseline OCaml collector using refs and boxed tuple returns.
+- `gc.ml` - zero-allocation OxCaml collector using `let mutable` and unboxed tuples.
+- `gc_zero_offheap.ml` - zero-allocation collector with C-side scratch state.
+- `gc_zero_offheap_threaded.ml` - off-heap collector invoked by a persistent worker thread.
+- `gc_stack_threaded.ml` - long-lived `exclave_` service-loop collector with stack-local state.
+- `tests/binary_tree_multithreaded.c` - correctness and performance benchmark.
+- `benchmarking/` - benchmark, summary, and plotting scripts plus current results.
+- `Report_Template/` - project report source and figures.
 
 ## Build
 
-Build the default zero-allocation collector and smoke test:
+Requires an OxCaml-capable `ocamlopt`, a C compiler, and pthreads.
 
 ```sh
-make
-./test
+make all
 ```
 
-Build a specific collector variant:
+Build one variant:
 
 ```sh
-make GC=zero test
-make GC=zero_offheap test
-make GC=zero_offheap_threaded test
-make GC=zero_stack_threaded test
-make GC=normal test
+make GC=zero_stack_threaded
 ```
 
-Build and run the binary-tree benchmark targets:
+Available variants:
 
-```sh
-make GC=zero_offheap binary_tree_test binary_tree_multithreaded_test
-./binary_tree_test 16
-./binary_tree_multithreaded_test 14 4
+```text
+normal
+zero
+zero_offheap
+zero_offheap_threaded
+zero_stack_threaded
 ```
 
-## Benchmark
-
-Run the full benchmark matrix:
-
-```sh
-./benchmarking/run_gc_benchmark.sh
-```
-
-Generate plots and summary CSVs:
-
-```sh
-python3 benchmarking/plot_gc_benchmark.py \
-  --csv benchmarking/benchmark_results.csv
-```
-
-See [`benchmarking/README.md`](benchmarking/README.md) for configurable depths,
-thread counts, repetitions, and variant subsets.
-
-## Current Results
-
-The checked-in benchmark artifacts show a modest but useful signal:
-
-- `zero_offheap` has the best aggregate mean in the current benchmark matrix.
-- `zero_stack_threaded` and `zero_offheap_threaded` are competitive on larger
-  depth/thread configurations.
-- Differences among OxCaml variants are small enough that repeated runs are
-  required before making strong claims.
-
-Useful artifacts:
-
-- `benchmarking/benchmark_results.csv`
-- `benchmarking/benchmark_plots/summary_stats.csv`
-- `benchmarking/benchmark_plots/normal_relative_speedup.csv`
-- `benchmarking/benchmark_plots/*.png`
-
-## Design Notes
-
-The runtime uses a semi-space heap with explicit root registration. Mutator
-threads push addresses of local pointer variables onto a thread-local root
-stack. During collection, the collector scans static roots, active mutator root
-stacks, and return-value roots, then performs Cheney-style traversal over
-objects copied into to-space.
-
-OxCaml zero-allocation annotations are used to keep bounded collector hot paths
-from allocating in the OCaml heap. The off-heap and stack-threaded variants
-experiment with reducing long-lived metadata pressure and making stack-local
-collector state practical across repeated collections.
-
-## Cleaning
-
-Remove local build products:
+Clean generated binaries and objects:
 
 ```sh
 make clean
 ```
 
-The `.gitignore` file excludes compiler outputs and local benchmark binaries so
-future commits can focus on source, documentation, scripts, and intentionally
-published result artifacts.
+## Run
+
+Smoke test:
+
+```sh
+bin/bench_normal 8 1
+```
+
+Full benchmark grid:
+
+```sh
+./benchmarking/bench.sh
+```
+
+Summarize current results:
+
+```sh
+python3 benchmarking/summarize.py benchmarking/results.csv
+```
+
+Generate plots:
+
+```sh
+python3 benchmarking/plot_benchmark.py
+```
+
+Plots and derived CSVs are written to `benchmarking/benchmark_plots/`.
+
+## Report
+
+The report source is in `Report_Template/main.tex`.
+
+If LaTeX is installed:
+
+```sh
+cd Report_Template
+pdflatex main && bibtex main && pdflatex main && pdflatex main
+```
+
+## Notes
+
+Generated build products, benchmark run logs, pause logs, and LaTeX build files
+are ignored via `.gitignore`. The committed benchmark artifacts are the compact
+CSV/plot outputs needed by the report and presentation.

@@ -1,142 +1,88 @@
-[@@@alert "-unsafe_multidomain"]
+(* gc_normal.ml — baseline semi-space collector.
 
-let max_static_roots = 1024
-let max_threads = 128
-let word_size = Sys.word_size / 8
+   Uses ordinary OCaml refs, arrays, and tuples for all bookkeeping.
+   Allocation in collector hot paths is allowed and not annotated. *)
 
-external malloc : int -> int = "oxcaml_gc_malloc"
-external memcpy : int -> int -> int -> unit = "oxcaml_gc_memcpy"
-external load_word : int -> int -> int = "oxcaml_gc_load_word"
-external store_word : int -> int -> int -> unit = "oxcaml_gc_store_word"
-external debug_collection_started : int -> unit = "oxcaml_gc_debug_collection_started"
-external debug_collection_finished : int -> unit = "oxcaml_gc_debug_collection_finished"
-external c_heap_size : unit -> int = "oxcaml_gc_c_heap_size"
-external c_from_heap : unit -> int = "oxcaml_gc_c_from_heap"
-external c_to_heap : unit -> int = "oxcaml_gc_c_to_heap"
-external c_cur_heap_ptr : unit -> int = "oxcaml_gc_c_cur_heap_ptr"
-external c_finish_collection : int -> unit = "oxcaml_gc_c_finish_collection"
+open Gc_prims
 
-let static_roots = Array.make max_static_roots 0
-let static_root_count = ref 0
+(* copy: if [v] points into from-space, copy the object to to-space at
+   [free_ptr], install a forwarding marker, and return both the new
+   pointer and the updated free pointer. Otherwise return [v] unchanged.
 
-let root_stack_ptrs = Array.make max_threads 0
-let stack_idx_ptrs = Array.make max_threads 0
-let gc_retval_ptrs = Array.make max_threads 0
-let active_threads = Array.make max_threads false
-let registered_threads = ref 0
-
-let is_heap_ptr value =
-  value <> 0 && value land 1 = 0
-
-let in_from_heap from_heap heap_size value =
-  value >= from_heap && value < from_heap + heap_size
-
-let init heap_bytes =
-  ignore heap_bytes;
-  static_root_count := 0;
-  registered_threads := 0;
-  1
-
-let bind_mutator root_stack_ptr stack_idx_ptr gc_retval_ptr =
-  let id = !registered_threads in
-  if id >= max_threads then -1
+   In the baseline this returns a tuple (the OCaml-allocating choice). *)
+let copy v free_ptr =
+  if not (is_from_ptr v) then (v, free_ptr)
   else begin
-    registered_threads := id + 1;
-    root_stack_ptrs.(id) <- root_stack_ptr;
-    stack_idx_ptrs.(id) <- stack_idx_ptr;
-    gc_retval_ptrs.(id) <- gc_retval_ptr;
-    active_threads.(id) <- true;
-    id
+    let header_addr = v - word_bytes in
+    let header = word_at header_addr in
+    if is_forwarded header then
+      (word_at v, free_ptr)
+    else begin
+      let total_words = header_total_words header in
+      let bytes = total_words * word_bytes in
+      let new_header_addr = free_ptr in
+      memcpy_words new_header_addr header_addr total_words;
+      let new_body_addr = new_header_addr + word_bytes in
+      (* Install forwarding *)
+      set_word_at header_addr 0;
+      set_word_at v new_body_addr;
+      (new_body_addr, free_ptr + bytes)
+    end
   end
-
-let destroy_mutator id =
-  if id >= 0 && id < !registered_threads then active_threads.(id) <- false
-
-let alloc_fast _size = 0
-
-let used_bytes () = c_cur_heap_ptr ()
-let free_bytes () = c_heap_size () - c_cur_heap_ptr ()
-let total_bytes () = c_heap_size ()
-
-let register_global_root root =
-  let idx = !static_root_count in
-  if idx >= max_static_roots then 0
-  else begin
-    static_roots.(idx) <- root;
-    static_root_count := idx + 1;
-    1
-  end
-
-let copy from_heap heap_size value free_ptr_ref =
-  if not (is_heap_ptr value && in_from_heap from_heap heap_size value) then value
-  else
-    let object_base = value - word_size in
-    let header = load_word object_base 0 in
-    if header = 0 then load_word object_base 1
-    else
-      let total_words = header lsr 10 in
-      let bytes = total_words * word_size in
-      let new_base = !free_ptr_ref in
-      memcpy new_base object_base bytes;
-      free_ptr_ref := new_base + bytes;
-      let new_body = new_base + word_size in
-      store_word object_base 0 0;
-      store_word object_base 1 new_body;
-      new_body
 
 let collect () =
-  let from_heap = c_from_heap () in
-  let heap_size = c_heap_size () in
-  let to_heap = c_to_heap () in
-  let used_bytes = c_cur_heap_ptr () in
-  debug_collection_started used_bytes;
-  let free_ptr = ref to_heap in
-  let scan_ptr = ref to_heap in
+  let free_ptr = ref (to_space_start ()) in
+  let scan_ptr = ref (to_space_start ()) in
 
-  for i = 0 to !static_root_count - 1 do
-    let root_addr = static_roots.(i) in
-    let root_value = load_word root_addr 0 in
-    store_word root_addr 0 (copy from_heap heap_size root_value free_ptr)
+  (* 1. Static roots *)
+  let nstatic = static_root_count () in
+  for i = 0 to nstatic - 1 do
+    let root_addr = static_root_addr i in
+    let v = word_at root_addr in
+    let v', fp = copy v !free_ptr in
+    free_ptr := fp;
+    set_word_at root_addr v'
   done;
 
-  for i = 0 to !registered_threads - 1 do
-    if active_threads.(i) then begin
-      let retval_addr = gc_retval_ptrs.(i) in
-      let retval = load_word retval_addr 0 in
-      if retval <> 0 then store_word retval_addr 0 (copy from_heap heap_size retval free_ptr);
-
-      let root_stack = root_stack_ptrs.(i) in
-      let stack_idx = load_word stack_idx_ptrs.(i) 0 in
-      for j = 0 to stack_idx - 1 do
-        let root_addr = load_word root_stack j in
-        let root_value = load_word root_addr 0 in
-        store_word root_addr 0 (copy from_heap heap_size root_value free_ptr)
+  (* 2. Per-thread roots *)
+  let nthr = thread_count () in
+  for t = 0 to nthr - 1 do
+    if thread_active t then begin
+      (* return value root *)
+      let rv_addr = thread_retval_addr t in
+      let rv = word_at rv_addr in
+      if rv <> 0 then begin
+        let rv', fp = copy rv !free_ptr in
+        free_ptr := fp;
+        set_word_at rv_addr rv'
+      end;
+      (* stack roots *)
+      let sz = thread_stack_size t in
+      for j = 0 to sz - 1 do
+        let p_addr = thread_root_addr t j in
+        let v = word_at p_addr in
+        let v', fp = copy v !free_ptr in
+        free_ptr := fp;
+        set_word_at p_addr v'
       done
     end
   done;
 
+  (* 3. Cheney walk *)
   while !scan_ptr < !free_ptr do
-    let object_base = !scan_ptr in
-    let header = load_word object_base 0 in
-    let total_words = header lsr 10 in
+    let header = word_at !scan_ptr in
+    let total_words = header_total_words header in
     for i = 1 to total_words - 1 do
-      let field = load_word object_base i in
-      if is_heap_ptr field then store_word object_base i (copy from_heap heap_size field free_ptr)
+      let field_addr = !scan_ptr + (i * word_bytes) in
+      let v = word_at field_addr in
+      let v', fp = copy v !free_ptr in
+      free_ptr := fp;
+      set_word_at field_addr v'
     done;
-    scan_ptr := object_base + (total_words * word_size)
+    scan_ptr := !scan_ptr + (total_words * word_bytes)
   done;
 
-  let new_used_bytes = !free_ptr - to_heap in
-  c_finish_collection new_used_bytes;
-  debug_collection_finished new_used_bytes
+  let used_bytes = !free_ptr - to_space_start () in
+  swap_spaces used_bytes
 
-let () =
-  Callback.register "oxcaml_gc_init" init;
-  Callback.register "oxcaml_gc_bind_mutator" bind_mutator;
-  Callback.register "oxcaml_gc_destroy_mutator" destroy_mutator;
-  Callback.register "oxcaml_gc_alloc_fast" alloc_fast;
-  Callback.register "oxcaml_gc_used_bytes" used_bytes;
-  Callback.register "oxcaml_gc_free_bytes" free_bytes;
-  Callback.register "oxcaml_gc_total_bytes" total_bytes;
-  Callback.register "oxcaml_gc_register_global_root" register_global_root;
-  Callback.register "oxcaml_gc_collect" collect
+let () = Callback.register "gc_collect" collect

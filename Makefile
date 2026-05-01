@@ -1,92 +1,86 @@
-OCAMLOPT ?= ocamlopt.opt
-OCAMLC ?= ocamlc
-CC ?= gcc
+# Makefile — builds the benchmark for any of the five GC variants.
+#
+# Usage:   make GC=normal           # variant 1
+#          make GC=zero             # variant 2
+#          make GC=zero_offheap     # variant 3
+#          make GC=zero_offheap_threaded   # variant 4
+#          make GC=zero_stack_threaded     # variant 5
+#          make all                 # build all five into bin/<variant>
+#
+# Each variant produces a binary at bin/bench_<variant>.
 
-OCAML_WHERE := $(shell $(OCAMLC) -where)
-CFLAGS := -Wall -Wextra -O2 -pthread -I. -I$(OCAML_WHERE)
-RUNTIME_CFLAGS := $(CFLAGS) -Dcaml_alloc=toycaml_alloc
-LDLIBS := $(OCAML_WHERE)/threads/threads.a -L$(OCAML_WHERE) -lthreadsnat_stubs -lasmrun -lm -ldl -lpthread
-GC ?= zero
-GC_FFI_OBJECT := gc_ffi.o
+GC          ?= normal
 
-ifeq ($(GC),zero)
-GC_OBJECT := gc_zero_ml.o
-else ifeq ($(GC),zero_offheap)
-GC_OBJECT := gc_zero_offheap_ml.o
-else ifeq ($(GC),zero_offheap_threaded)
-GC_OBJECT := gc_zero_offheap_ml.o
-GC_FFI_OBJECT := gc_ffi_threaded.o
-else ifeq ($(GC),zero_stack_threaded)
-GC_OBJECT := gc_stack_threaded_ml.o
-GC_FFI_OBJECT := gc_ffi_stack_threaded.o
-else ifeq ($(GC),normal)
-GC_OBJECT := gc_normal_ml.o
-else
-$(error GC must be one of zero, zero_offheap, zero_offheap_threaded, zero_stack_threaded, normal)
-endif
+OCAMLOPT     := ocamlopt
+OCAML_LIBDIR := $(shell $(OCAMLOPT) -where)
+CC           ?= cc
+CFLAGS       ?= -O2 -Wall -Wno-unused-parameter -pthread -I$(OCAML_LIBDIR)
+LDFLAGS      ?= -lpthread -lm -ldl
+OCAML_RUNTIME_LIBS := $(OCAML_LIBDIR)/libasmrun.a \
+                      $(OCAML_LIBDIR)/libthreadsnat_stubs.a
 
-.PHONY: all clean test zero zero_offheap zero_offheap_threaded zero_stack_threaded normal binary_tree_test binary_tree_multithreaded_test
+BIN_DIR  := bin
+BUILD_DIR := build
 
-all: test
+VARIANTS := normal zero zero_offheap zero_offheap_threaded zero_stack_threaded
 
-gc_zero_ml.o: gc.ml
-	$(OCAMLOPT) -zero-alloc-check all -output-obj -o $@ $<
+# Map variant name to OCaml source file.
+ML_normal                := gc_normal.ml
+ML_zero                  := gc.ml
+ML_zero_offheap          := gc_zero_offheap.ml
+ML_zero_offheap_threaded := gc_zero_offheap_threaded.ml
+ML_zero_stack_threaded   := gc_stack_threaded.ml
 
-gc_zero_offheap_ml.o: gc_zero_offheap.ml
-	$(OCAMLOPT) -zero-alloc-check all -output-obj -o $@ $<
+# Per-variant CFLAGS for gc_bridge.c.
+BRIDGE_FLAGS_normal                :=
+BRIDGE_FLAGS_zero                  :=
+BRIDGE_FLAGS_zero_offheap          :=
+BRIDGE_FLAGS_zero_offheap_threaded := -DGC_VARIANT_PERSISTENT_THREAD=1
+BRIDGE_FLAGS_zero_stack_threaded   := -DGC_VARIANT_PERSISTENT_THREAD=1 -DGC_VARIANT_STACK_THREADED=1
 
-gc_stack_threaded_ml.o: gc_stack_threaded.ml
-	$(OCAMLOPT) -zero-alloc-check all -output-obj -o $@ $<
+# Default target builds the variant given by GC=.
+.PHONY: default all clean
+default: $(BIN_DIR)/bench_$(GC)
 
-gc_normal_ml.o: gc_normal.ml
-	$(OCAMLOPT) -output-obj -o $@ $<
+all: $(addprefix $(BIN_DIR)/bench_,$(VARIANTS))
 
-gc_ffi.o: gc_ffi.c runtime.h mmtk-bindings/include/mmtk.h
-	$(CC) $(CFLAGS) -c -o $@ $<
+$(BIN_DIR) $(BUILD_DIR):
+	@mkdir -p $@
 
-gc_ffi_threaded.o: gc_ffi.c runtime.h mmtk-bindings/include/mmtk.h
-	$(CC) $(CFLAGS) -DGC_THREAD_RUNTIME -c -o $@ $<
+# Pattern: build/<variant>/native.o is the linked-in OCaml code.
+# We compile gc_prims.ml plus the variant source via ocamlopt -output-complete-obj.
+.SECONDEXPANSION:
+$(BUILD_DIR)/%/native.o: $$(ML_%) gc_prims.ml | $(BUILD_DIR)
+	@mkdir -p $(BUILD_DIR)/$*
+	$(OCAMLOPT) -output-complete-obj -extension layouts -extension small_numbers \
+	    -extension let_mutable -extension mode \
+	    -O3 -opaque \
+	    -I $(BUILD_DIR)/$* \
+	    -o $@ \
+	    gc_prims.ml $(ML_$*)
 
-gc_ffi_stack_threaded.o: gc_ffi.c runtime.h mmtk-bindings/include/mmtk.h
-	$(CC) $(CFLAGS) -DGC_STACK_THREAD_RUNTIME -c -o $@ $<
+# Per-variant gc_bridge object.
+$(BUILD_DIR)/%/gc_bridge.o: gc_bridge.c runtime.h | $(BUILD_DIR)
+	@mkdir -p $(BUILD_DIR)/$*
+	$(CC) $(CFLAGS) $(BRIDGE_FLAGS_$*) -DGC_VARIANT_NAME=\"$*\" -c gc_bridge.c -o $@
 
-runtime.o: runtime.c runtime.h mmtk-bindings/include/mmtk.h
-	$(CC) $(RUNTIME_CFLAGS) -c -o $@ $<
+$(BUILD_DIR)/runtime.o: runtime.c runtime.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c runtime.c -o $@
 
-smoke_test.o: smoke_test.c runtime.h
-	$(CC) $(RUNTIME_CFLAGS) -c -o $@ $<
+$(BUILD_DIR)/main_glue.o: main_glue.c runtime.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c main_glue.c -o $@
 
-test: $(GC_OBJECT) $(GC_FFI_OBJECT) runtime.o smoke_test.o
-	$(CC) -o $@ $^ $(LDLIBS)
+$(BUILD_DIR)/binary_tree_multithreaded.o: tests/binary_tree_multithreaded.c runtime.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -c tests/binary_tree_multithreaded.c -o $@
 
-zero:
-	$(MAKE) GC=zero test
-
-zero_offheap:
-	$(MAKE) GC=zero_offheap test
-
-zero_offheap_threaded:
-	$(MAKE) GC=zero_offheap_threaded test
-
-zero_stack_threaded:
-	$(MAKE) GC=zero_stack_threaded test
-
-normal:
-	$(MAKE) GC=normal test
-
-binary_tree.o: benchmarks/binary_tree.c runtime.h
-	$(CC) $(RUNTIME_CFLAGS) -c -o $@ $<
-
-binary_tree_test: $(GC_OBJECT) $(GC_FFI_OBJECT) runtime.o binary_tree.o
-	$(CC) -o $@ $^ $(LDLIBS)
-
-binary_tree_multithreaded.o: benchmarks/binary_tree_multithreaded.c runtime.h
-	$(CC) $(RUNTIME_CFLAGS) -c -o $@ $<
-
-binary_tree_multithreaded_test: $(GC_OBJECT) $(GC_FFI_OBJECT) runtime.o binary_tree_multithreaded.o
-	$(CC) -o $@ $^ $(LDLIBS)
+# Link the final binary.
+$(BIN_DIR)/bench_%: $(BUILD_DIR)/%/native.o $(BUILD_DIR)/%/gc_bridge.o \
+                    $(BUILD_DIR)/runtime.o $(BUILD_DIR)/main_glue.o \
+                    $(BUILD_DIR)/binary_tree_multithreaded.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ \
+	    $(OCAML_RUNTIME_LIBS) \
+	    $(LDFLAGS) \
+	    -o $@
 
 clean:
-	rm -f test binary_tree_test binary_tree_multithreaded_test *.o *.cmx *.cmi *.cmti *.cmt
-	rm -f benchmarking/alloc_free_gc_zero benchmarking/alloc_free_gc_zero_offheap benchmarking/alloc_free_gc_zero_offheap_threaded benchmarking/alloc_free_gc_zero_stack_threaded benchmarking/alloc_free_gc_normal
-	rm -rf _build
+	rm -rf $(BUILD_DIR) $(BIN_DIR)

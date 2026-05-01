@@ -1,9 +1,8 @@
-(* gc_zero_offheap.ml — variant 3: zero-alloc + off-heap scratch state.
-
-   Differences from gc.ml:
-     - free_ptr / scan_ptr live in C-side globals, accessed through
-       no-alloc primitives (get_g_free / set_g_free / ...).
-     - The OCaml side carries no persistent collector state. *)
+(* gc_zero_offheap_threaded.ml — variant 4: same algorithm and off-heap
+   scratch state as variant 3, but invoked from a persistent OCaml-aware
+   GC worker thread (selected via the build-time GC_VARIANT_PERSISTENT_THREAD
+   flag in gc_bridge.c). The OCaml side here is identical to variant 3;
+   the persistence happens in the C bridge. *)
 
 open Gc_prims
 
@@ -31,7 +30,6 @@ let[@zero_alloc] collect () =
   set_g_free to_start;
   set_g_scan to_start;
 
-  (* Static roots *)
   let nstatic = static_root_count () in
   for i = 0 to nstatic - 1 do
     let root_addr = static_root_addr i in
@@ -40,7 +38,6 @@ let[@zero_alloc] collect () =
     set_word_at root_addr v'
   done;
 
-  (* Per-thread roots *)
   let nthr = thread_count () in
   for t = 0 to nthr - 1 do
     if thread_active t then begin
@@ -60,7 +57,6 @@ let[@zero_alloc] collect () =
     end
   done;
 
-  (* Cheney walk *)
   let mutable scan_ptr = get_g_scan () in
   let mutable free_ptr = get_g_free () in
   while scan_ptr < free_ptr do
@@ -73,7 +69,6 @@ let[@zero_alloc] collect () =
       set_word_at field_addr v'
     done;
     scan_ptr <- scan_ptr + (total_words * word_bytes);
-    (* Refresh free_ptr; the loop body may have advanced it via copy_into. *)
     free_ptr <- get_g_free ()
   done;
 
